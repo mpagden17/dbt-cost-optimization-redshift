@@ -1,0 +1,14 @@
+select
+    table_catalog as database_name,
+    table_schema as schema_name,
+    table_name,
+    active_bytes,
+    time_travel_bytes,
+    failsafe_bytes,
+    coalesce(deleted, false) as is_deleted
+from {{ ref('stg_snowflake__table_storage_metrics') }}
+where coalesce(deleted, false) = false
+qualify row_number() over (
+    partition by table_catalog, table_schema, table_name
+    order by id desc
+) = 1

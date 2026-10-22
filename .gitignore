@@ -1,0 +1,70 @@
+# macOS
+.DS_Store
+
+# dbt
+target/
+dbt_packages/
+logs/
+*.log
+package-lock.yml
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+*.egg-info/
+*.egg
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Environment variables
+.env
+.env.local
+
+# Integration tests
+# Allow users to add their own database credentials for testing
+# Use profiles.ci.yml for CI/CD (with dummy credentials)
+# Copy profiles.example.yml to profiles.yml for local testing
+integration_tests/profiles.yml
+integration_tests/.user.yml
+
+dbt_internal_packages/
+
+archived/
+
+.claude/
+.snowflake/
+
+.dbtignore
+
+# Local test seeds (not for committing)
+seeds/
+
+# Internal planning / spec docs (kept locally, not tracked)
+docs/superpowers/
+
+macro-dispatch-refactor-plan.md
+merge-conflict-resolution-plan-pr14.md
+v2-first-v1-later.md
+skill-planning.md
+clustering-evidence-coverage-plan.md
+spillage-cost-plan.md
+refinements-build-plan.md
+clustering-evidence-coverage-plan.md
+
+# Internal dev tooling (kept locally, not tracked)
+CLAUDE.md
+.mcp.json
+claude-chat.txt
+# Docs site build output (mkdocs build)
+site/

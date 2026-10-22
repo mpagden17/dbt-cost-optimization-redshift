@@ -1,0 +1,576 @@
+version: 2
+
+unit_tests:
+  - name: top_recommendations_filters_dedupes_and_ranks
+    description: >
+      vw_snowflake__top_recommendations keeps only P1/P2 actionable signals, returns
+      one row per dedup_key (lowest tier, then highest savings), counts the entity's
+      qualifying signals in related_signals_count, and dense-ranks the result by tier,
+      then savings (nulls last).
+
+      Cases:
+        - model_a: a P1 signal with LOWER savings beats a P2 signal with higher savings
+          (tier wins over savings); related_signals_count = 2.
+        - model_b: highest-savings P1 signal ranks first. Its extra 'monitor' signal is
+          filtered out, so related_signals_count = 1. model_name comes from
+          node_model_name (coalesce).
+        - wh_x: a P2 warehouse signal with no node_model_name falls back to model_name.
+        - model_e: a P2 signal with null savings ranks after one with savings.
+        - model_c (P3) and model_d (P1 but 'monitor') are excluded entirely.
+    model: vw_snowflake__top_recommendations
+    given:
+      - input: ref('int_snowflake__all_recommendations')
+        rows:
+          - {dedup_key: model_a, domain: clustering,      signal_id: add_clustering_key_strong, priority_tier: 1, backlog_status: actionable, estimated_annual_savings_usd: 500,  score: 10, node_model_name: fct_a, model_name: fct_a}
+          - {dedup_key: model_a, domain: materialization, signal_id: materialize_as_table,      priority_tier: 2, backlog_status: actionable, estimated_annual_savings_usd: 900,  score: 10, node_model_name: fct_a, model_name: fct_a}
+          - {dedup_key: model_b, domain: materialization, signal_id: convert_to_incremental,    priority_tier: 1, backlog_status: actionable, estimated_annual_savings_usd: 1000, score: 10, node_model_name: fct_b, model_name: raw_b}
+          - {dedup_key: model_b, domain: clustering,      signal_id: add_clustering_key_good,   priority_tier: 2, backlog_status: monitor,    estimated_annual_savings_usd: 50,   score: 10, node_model_name: fct_b, model_name: raw_b}
+          - {dedup_key: wh_x,    domain: warehouse,       signal_id: oversized_scale_down,      priority_tier: 2, backlog_status: actionable, estimated_annual_savings_usd: 300,  score: 10, node_model_name: null,  model_name: wh_x_name}
+          - {dedup_key: model_e, domain: clustering,      signal_id: add_clustering_key_evaluate, priority_tier: 2, backlog_status: actionable, estimated_annual_savings_usd: null, score: 10, node_model_name: fct_e, model_name: fct_e}
+          - {dedup_key: model_c, domain: clustering,      signal_id: add_clustering_key_good,   priority_tier: 3, backlog_status: actionable, estimated_annual_savings_usd: 5000, score: 10, node_model_name: fct_c, model_name: fct_c}
+          - {dedup_key: model_d, domain: warehouse,       signal_id: provisioning_gen2,         priority_tier: 1, backlog_status: monitor,    estimated_annual_savings_usd: 5000, score: 10, node_model_name: fct_d, model_name: fct_d}
+    expect:
+      rows:
+        - {priority_rank: 1, signal_id: convert_to_incremental,      model_name: fct_b,     related_signals_count: 1}
+        - {priority_rank: 2, signal_id: add_clustering_key_strong,   model_name: fct_a,     related_signals_count: 2}
+        - {priority_rank: 3, signal_id: oversized_scale_down,        model_name: wh_x_name, related_signals_count: 1}
+        - {priority_rank: 4, signal_id: add_clustering_key_evaluate, model_name: fct_e,     related_signals_count: 1}
+
+  - name: cost_savings_summary_aggregates_actionable_by_domain
+    description: >
+      vw_snowflake__cost_savings_summary counts only actionable signals, groups them by
+      domain, counts config_change signals as quick wins, treats null cost/savings as 0,
+      returns a null savings_pct when the domain's cost total is 0, and picks the
+      highest-savings recommendation as the domain's top recommendation.
+
+      Cases:
+        - clustering: two actionable signals (one config_change, one sql_refactor) plus a
+          large 'monitor' signal that must be ignored. Totals 2000 cost / 1000 savings → 50.0%.
+        - warehouse: one actionable signal with null savings and 0 cost → savings 0,
+          savings_pct null (no divide-by-zero).
+        - ai: only a 'monitor' signal, so the domain does not appear.
+    model: vw_snowflake__cost_savings_summary
+    given:
+      - input: ref('int_snowflake__all_recommendations')
+        rows:
+          - {domain: clustering, backlog_status: actionable, effort_category: config_change, estimated_annual_cost_usd: 1000, estimated_annual_savings_usd: 300,  recommendation: cl_quick_win}
+          - {domain: clustering, backlog_status: actionable, effort_category: sql_refactor,  estimated_annual_cost_usd: 1000, estimated_annual_savings_usd: 700,  recommendation: cl_refactor}
+          - {domain: clustering, backlog_status: monitor,    effort_category: config_change, estimated_annual_cost_usd: 9000, estimated_annual_savings_usd: 9000, recommendation: cl_ignored}
+          - {domain: warehouse,  backlog_status: actionable, effort_category: config_change, estimated_annual_cost_usd: 0,    estimated_annual_savings_usd: null, recommendation: wh_only}
+          - {domain: ai,         backlog_status: monitor,    effort_category: config_change, estimated_annual_cost_usd: 500,  estimated_annual_savings_usd: 100,  recommendation: ai_ignored}
+    expect:
+      rows:
+        - {domain: clustering, total_recommendations: 2, quick_win_count: 1, estimated_annual_cost_usd: 2000, estimated_annual_savings_usd: 1000, savings_pct: 50.0, top_recommendation: cl_refactor, top_recommendation_savings_usd: 700}
+        - {domain: warehouse,  total_recommendations: 1, quick_win_count: 1, estimated_annual_cost_usd: 0,    estimated_annual_savings_usd: 0,    savings_pct: null, top_recommendation: wh_only,     top_recommendation_savings_usd: 0}
+
+  - name: ai_optimizations_filters_and_dedupes_ai_signals
+    description: >
+      vw_snowflake__ai_optimizations keeps only ai-domain signals that are actionable or
+      monitor, returns one row per dedup_key (highest savings with nulls last, then score),
+      and exposes entity_name as service_or_model.
+
+      Cases:
+        - m1: two signals; the one with higher savings wins.
+        - m2: a signal WITH savings beats a null-savings signal even though the null one
+          has a higher score (nulls last).
+        - m5: a 'monitor' signal is kept, with backlog_status = monitor.
+        - m3 ('stable') and m4 (clustering domain) are excluded.
+    model: vw_snowflake__ai_optimizations
+    given:
+      - input: ref('int_snowflake__all_recommendations')
+        rows:
+          - {dedup_key: m1, domain: ai,         backlog_status: actionable, entity_name: svc_m1, recommendation: r_m1_low,  estimated_annual_savings_usd: 100,  score: 1}
+          - {dedup_key: m1, domain: ai,         backlog_status: actionable, entity_name: svc_m1, recommendation: r_m1_high, estimated_annual_savings_usd: 200,  score: 1}
+          - {dedup_key: m2, domain: ai,         backlog_status: actionable, entity_name: svc_m2, recommendation: r_m2_null, estimated_annual_savings_usd: null, score: 9}
+          - {dedup_key: m2, domain: ai,         backlog_status: actionable, entity_name: svc_m2, recommendation: r_m2_ten,  estimated_annual_savings_usd: 10,   score: 1}
+          - {dedup_key: m3, domain: ai,         backlog_status: stable,     entity_name: svc_m3, recommendation: r_m3,      estimated_annual_savings_usd: 999,  score: 1}
+          - {dedup_key: m4, domain: clustering, backlog_status: actionable, entity_name: svc_m4, recommendation: r_m4,      estimated_annual_savings_usd: 999,  score: 1}
+          - {dedup_key: m5, domain: ai,         backlog_status: monitor,    entity_name: svc_m5, recommendation: r_m5,      estimated_annual_savings_usd: 5,    score: 1}
+    expect:
+      rows:
+        - {service_or_model: svc_m1, recommendation: r_m1_high, backlog_status: actionable}
+        - {service_or_model: svc_m2, recommendation: r_m2_ten,  backlog_status: actionable}
+        - {service_or_model: svc_m5, recommendation: r_m5,      backlog_status: monitor}
+
+  - name: top_expensive_queries_upgrades_queries_with_fixable_root_causes
+    description: >
+      vw_snowflake__top_expensive_queries keeps warehouse sql_refactor signals that are
+      actionable or monitor. When the same model has an ACTIONABLE clustering or
+      materialization signal, the query is upgraded: priority_tier capped at 2,
+      backlog_status set to actionable, and the recommendation and reason rewritten to name
+      the fix. Queries without such co-signals keep their original values.
+
+      Cases:
+        - hash_1 (model n1): a 'monitor' query with an actionable clustering co-signal is
+          upgraded (tier 5 → 2, monitor → actionable). n1's second, 'monitor' clustering
+          signal is ignored, so co_signal_count = 1.
+        - hash_2 (model n2): no co-signals, so it is unchanged.
+        - hash_3 (config_change) and hash_4 ('stable') are excluded.
+    model: vw_snowflake__top_expensive_queries
+    given:
+      - input: ref('int_snowflake__all_recommendations')
+        rows:
+          - {domain: warehouse,  effort_category: sql_refactor,  backlog_status: monitor,    node_id: n1, entity_name: hash_1, signal_id: expensive_query_monitor,   priority_tier: 5, recommendation: base_rec_1, recommendation_reason: Projected cost high.}
+          - {domain: clustering, effort_category: config_change, backlog_status: actionable, node_id: n1, entity_name: tbl_n1, signal_id: add_clustering_key_strong, priority_tier: 3, recommendation: add_key,    recommendation_reason: Poor pruning.}
+          - {domain: clustering, effort_category: config_change, backlog_status: monitor,    node_id: n1, entity_name: tbl_n1, signal_id: add_clustering_key_good,   priority_tier: 3, recommendation: add_key_2,  recommendation_reason: Ignored.}
+          - {domain: warehouse,  effort_category: sql_refactor,  backlog_status: monitor,    node_id: n2, entity_name: hash_2, signal_id: expensive_query_monitor,   priority_tier: 5, recommendation: base_rec_2, recommendation_reason: Recurring cost.}
+          - {domain: warehouse,  effort_category: config_change, backlog_status: actionable, node_id: n3, entity_name: hash_3, signal_id: oversized_scale_down,      priority_tier: 4, recommendation: rec_3,      recommendation_reason: Excluded.}
+          - {domain: warehouse,  effort_category: sql_refactor,  backlog_status: stable,     node_id: n4, entity_name: hash_4, signal_id: expensive_query_monitor,   priority_tier: 5, recommendation: rec_4,      recommendation_reason: Excluded.}
+    expect:
+      rows:
+        - {query_hash: hash_1, priority_tier: 2, backlog_status: actionable, co_signal_count: 1, co_occurring_fixes: clustering, recommendation: "Actionable — clustering optimization(s) available", recommendation_reason: "Projected cost high. Root cause: clustering signal(s) detected for this model."}
+        - {query_hash: hash_2, priority_tier: 5, backlog_status: monitor,    co_signal_count: 0, co_occurring_fixes: null,       recommendation: base_rec_2, recommendation_reason: Recurring cost.}
+
+  - name: cross_domain_insights_maps_signal_combinations_to_root_causes
+    description: >
+      vw_snowflake__cross_domain_insights groups a model's signals into categories, keeps
+      only models with at least two distinct categories, and maps the combination to a
+      root cause and recommended action (first matching rule wins). Clustering signals
+      only count when actionable; other signals count when actionable or monitor.
+
+      Cases:
+        - n1: materialization + spillage → recomputation spill root cause, "Materialize".
+          insight_id = md5(node_id). primary_recommendation is the lowest-tier signal's.
+        - n2: incremental + expensive query (monitor) → full-rebuild root cause, "Convert to incremental".
+        - n3: clustering (actionable) + expensive query → missing-clustering root cause, "Add clustering key".
+        - n6: materialization + clustering → no specific rule matches → "compound inefficiency".
+        - n4: clustering is only 'monitor', so just spillage counts (1 category) → excluded.
+        - n5: two spillage signals are one category → excluded.
+        - a row with null node_id → excluded.
+      View chains (int_snowflake__table_upstream_views): view_chain is a signal and counts
+      toward the minimum of two.
+        - n7: incremental + spillage + chain → the model's own root cause and action, plus
+          the chain's part and "additionally, materialize v7 as a table".
+        - n8: spillage + chain only → the chain is the headline: "Materialize v8 as a table".
+        - n9: expensive query + chain, no recommended view to name → points to
+          vw_snowflake__dbt_model_optimizations; "adds to its cost".
+        - n10: clustering + chain, no spillage or expensive query → no addendum.
+        - n11: incremental + expensive query + chain, no recommended view → addendum
+          without a view name.
+    model: vw_snowflake__cross_domain_insights
+    given:
+      - input: ref('int_snowflake__all_recommendations')
+        rows:
+          - {node_id: n1, model_name: m1, table_fqn: db.s.m1, domain: materialization, signal_id: materialize_as_table,        backlog_status: actionable, priority_tier: 2, recommendation: rec_materialize}
+          - {node_id: n1, model_name: m1, table_fqn: db.s.m1, domain: warehouse,       signal_id: spillage_scale_up,           backlog_status: actionable, priority_tier: 4, recommendation: rec_spill}
+          - {node_id: n2, model_name: m2, table_fqn: db.s.m2, domain: materialization, signal_id: convert_to_incremental,      backlog_status: actionable, priority_tier: 2, recommendation: rec_incremental}
+          - {node_id: n2, model_name: m2, table_fqn: db.s.m2, domain: warehouse,       signal_id: expensive_query_monitor,     backlog_status: monitor,    priority_tier: 5, recommendation: rec_expensive}
+          - {node_id: n3, model_name: m3, table_fqn: db.s.m3, domain: clustering,      signal_id: add_clustering_key_strong,   backlog_status: actionable, priority_tier: 3, recommendation: rec_cluster}
+          - {node_id: n3, model_name: m3, table_fqn: db.s.m3, domain: warehouse,       signal_id: expensive_query_actionable,  backlog_status: actionable, priority_tier: 5, recommendation: rec_expensive}
+          - {node_id: n6, model_name: m6, table_fqn: db.s.m6, domain: materialization, signal_id: materialize_as_table,        backlog_status: actionable, priority_tier: 2, recommendation: rec_materialize}
+          - {node_id: n6, model_name: m6, table_fqn: db.s.m6, domain: clustering,      signal_id: add_clustering_key_good,     backlog_status: actionable, priority_tier: 3, recommendation: rec_cluster}
+          - {node_id: n4, model_name: m4, table_fqn: db.s.m4, domain: clustering,      signal_id: add_clustering_key_good,     backlog_status: monitor,    priority_tier: 3, recommendation: rec_cluster}
+          - {node_id: n4, model_name: m4, table_fqn: db.s.m4, domain: warehouse,       signal_id: spillage_scale_up,           backlog_status: actionable, priority_tier: 4, recommendation: rec_spill}
+          - {node_id: n5, model_name: m5, table_fqn: db.s.m5, domain: warehouse,       signal_id: spillage_scale_up,           backlog_status: actionable, priority_tier: 4, recommendation: rec_spill}
+          - {node_id: n5, model_name: m5, table_fqn: db.s.m5, domain: warehouse,       signal_id: spillage_moderate_stable,    backlog_status: actionable, priority_tier: 5, recommendation: rec_spill_2}
+          - {node_id: null, model_name: mx, table_fqn: db.s.mx, domain: materialization, signal_id: materialize_as_table,      backlog_status: actionable, priority_tier: 2, recommendation: rec_materialize}
+          - {node_id: null, model_name: mx, table_fqn: db.s.mx, domain: warehouse,     signal_id: spillage_scale_up,           backlog_status: actionable, priority_tier: 4, recommendation: rec_spill}
+          - {node_id: n7, model_name: m7, table_fqn: db.s.m7, domain: materialization, signal_id: apply_incremental_merge,     backlog_status: actionable, priority_tier: 1, recommendation: rec_incremental}
+          - {node_id: n7, model_name: m7, table_fqn: db.s.m7, domain: warehouse,       signal_id: spillage_scale_up,           backlog_status: actionable, priority_tier: 2, recommendation: rec_spill}
+          - {node_id: n8, model_name: m8, table_fqn: db.s.m8, domain: warehouse,       signal_id: spillage_moderate_stable,    backlog_status: monitor,    priority_tier: 1, recommendation: rec_spill}
+          - {node_id: n9, model_name: m9, table_fqn: db.s.m9, domain: warehouse,       signal_id: expensive_query_monitor,     backlog_status: monitor,    priority_tier: 1, recommendation: rec_expensive}
+          - {node_id: n10, model_name: m10, table_fqn: db.s.m10, domain: clustering,   signal_id: add_clustering_key_strong,   backlog_status: actionable, priority_tier: 1, recommendation: rec_cluster}
+          - {node_id: n11, model_name: m11, table_fqn: db.s.m11, domain: materialization, signal_id: convert_to_incremental,   backlog_status: actionable, priority_tier: 1, recommendation: rec_incremental}
+          - {node_id: n11, model_name: m11, table_fqn: db.s.m11, domain: warehouse,    signal_id: expensive_query_actionable,  backlog_status: actionable, priority_tier: 2, recommendation: rec_expensive}
+      - input: ref('int_snowflake__table_upstream_views')
+        rows:
+          - {table_dbt_model: n7,  upstream_view_chain: 'e7 (ephemeral), v7 (view), u7 (view)', upstream_view_count: 3, chain_recommended_view: v7}
+          - {table_dbt_model: n8,  upstream_view_chain: 'v8 (view), u8 (view)',                  upstream_view_count: 2, chain_recommended_view: v8}
+          - {table_dbt_model: n9,  upstream_view_chain: 'e9 (ephemeral)',                        upstream_view_count: 1, chain_recommended_view: null}
+          - {table_dbt_model: n10, upstream_view_chain: 'v10 (view)',                            upstream_view_count: 1, chain_recommended_view: v10}
+          - {table_dbt_model: n11, upstream_view_chain: 'v11 (view)',                            upstream_view_count: 1, chain_recommended_view: null}
+    expect:
+      rows:
+        - {node_id: n1, insight_id: c82561ec215a6e31807ceedf3b3bd25e, signal_count: 2, primary_recommendation: rec_materialize, root_cause: "View recomputation creates large intermediate results that spill — high warehouse impact", recommended_action: "Materialize the view — eliminates cascading recomputation"}
+        - {node_id: n2, insight_id: a6bbc91ae73dd21c0533f735470a9cd0, signal_count: 2, primary_recommendation: rec_incremental, root_cause: "Query is expensive because it rebuilds the full table every run",   recommended_action: "Convert to incremental — smaller working set resolves secondary issues"}
+        - {node_id: n3, insight_id: 4443aee183b279f76a95c13c7f5bca0d, signal_count: 2, primary_recommendation: rec_cluster,     root_cause: "Expensive queries scan the full table because it lacks clustering", recommended_action: "Add clustering key — reduces scan volume and downstream compute"}
+        - {node_id: n6, insight_id: b555773768bc1a672947d7f41f9c247f, signal_count: 2, primary_recommendation: rec_materialize, root_cause: "Multiple optimization signals detected — compound inefficiency",   recommended_action: "Materialize the view — eliminates cascading recomputation"}
+        - {node_id: n7, insight_id: c364e7cd25ef8288236d31f1ed69a94a, signal_count: 3, primary_recommendation: rec_incremental, root_cause: "Full table rebuilds overflow memory — high warehouse impact. Builds recompute 3 upstream view(s) inline, enlarging the working set that spills", recommended_action: "Convert to incremental — smaller working set resolves secondary issues; additionally, materialize v7 as a table: this model's builds recompute 3 upstream view(s), which adds to its spill"}
+        - {node_id: n8, insight_id: 5849253c0c07f8894c9ff2e5b69e834a, signal_count: 2, primary_recommendation: rec_spill, root_cause: "Builds recompute 2 upstream view(s) inline, enlarging the working set that spills", recommended_action: "Materialize v8 as a table: this model's builds recompute 2 upstream view(s), which adds to its spill"}
+        - {node_id: n9, insight_id: 06e7223b88d7d4640370627fd53901dc, signal_count: 2, primary_recommendation: rec_expensive, root_cause: "Builds are expensive partly because they recompute 1 upstream view(s)", recommended_action: "Its builds recompute 1 upstream view(s), which adds to its cost. See vw_snowflake__dbt_model_optimizations"}
+        - {node_id: n10, insight_id: b673e0e04fef7b457fb2825b040b844c, signal_count: 2, primary_recommendation: rec_cluster, root_cause: "Builds recompute 1 upstream view(s) inline", recommended_action: "Add clustering key — reduces scan volume and downstream compute"}
+        - {node_id: n11, insight_id: c1aae165bc91698aa6f7fe3a36fb8bd2, signal_count: 3, primary_recommendation: rec_incremental, root_cause: "Query is expensive because it rebuilds the full table every run. Builds are expensive partly because they recompute 1 upstream view(s)", recommended_action: "Convert to incremental — smaller working set resolves secondary issues; additionally, its builds recompute 1 upstream view(s), which adds to its cost (see vw_snowflake__dbt_model_optimizations)"}
+
+  - name: optimization_backlog_dedupes_environments_and_classifies_actions
+    description: >
+      vw_snowflake__optimization_backlog keeps actionable and monitor signals, collapses
+      the same signal seen in several environments to one row (highest savings), counts
+      the model's relations from int_snowflake__dbt_relation_history (defaulting to 1; null
+      on rows with no model),
+      and classifies each row's action_type: snowflake_ddl when DDL exists (even if a dbt
+      config also exists), dbt_config when only a config exists, otherwise investigation.
+
+      Cases:
+        - k1 (n1): the same signal in two environments → one row with the higher savings
+          (100); n1 has two distinct table_fqns in relation history → deployed_relation_count 2.
+        - k2 (n2): dbt config only → dbt_config; no relation history → deployed_relation_count 1.
+        - k3: no DDL or config → investigation; no model → deployed_relation_count null.
+        - k5: both DDL and config → snowflake_ddl (DDL takes precedence).
+        - k4 ('stable') is excluded.
+    model: vw_snowflake__optimization_backlog
+    given:
+      - input: ref('int_snowflake__all_recommendations')
+        rows:
+          - {dedup_key: k1, domain: clustering,      signal_id: add_clustering_key_strong, node_id: n1,   backlog_status: actionable, estimated_annual_savings_usd: 100, score: 1, snowflake_ddl: alter_table_k1, dbt_model_config: null}
+          - {dedup_key: k1, domain: clustering,      signal_id: add_clustering_key_strong, node_id: n1,   backlog_status: actionable, estimated_annual_savings_usd: 50,  score: 1, snowflake_ddl: alter_table_k1, dbt_model_config: null}
+          - {dedup_key: k2, domain: materialization, signal_id: materialize_as_table,      node_id: n2,   backlog_status: monitor,    estimated_annual_savings_usd: 30,  score: 1, snowflake_ddl: null,           dbt_model_config: materialized_table}
+          - {dedup_key: k3, domain: warehouse,       signal_id: expensive_query_monitor,   node_id: null, backlog_status: actionable, estimated_annual_savings_usd: 20,  score: 1, snowflake_ddl: null,           dbt_model_config: null}
+          - {dedup_key: k4, domain: clustering,      signal_id: add_clustering_key_good,   node_id: n4,   backlog_status: stable,     estimated_annual_savings_usd: 999, score: 1, snowflake_ddl: alter_table_k4, dbt_model_config: null}
+          - {dedup_key: k5, domain: materialization, signal_id: convert_to_incremental,    node_id: n5,   backlog_status: actionable, estimated_annual_savings_usd: 10,  score: 1, snowflake_ddl: alter_table_k5, dbt_model_config: incremental_cfg}
+      - input: ref('int_snowflake__dbt_relation_history')
+        rows:
+          - {node_id: n1, table_fqn: db.dev.t1,  dbt_cloud_environment_id: env_dev}
+          - {node_id: n1, table_fqn: db.prod.t1, dbt_cloud_environment_id: env_prod}
+          - {node_id: n1, table_fqn: db.prod.t1, dbt_cloud_environment_id: env_prod}
+          - {node_id: n9, table_fqn: db.prod.t9, dbt_cloud_environment_id: env_prod}
+    expect:
+      rows:
+        - {signal_id: add_clustering_key_strong, estimated_annual_savings_usd: 100, action_type: snowflake_ddl, deployed_relation_count: 2}
+        - {signal_id: materialize_as_table,      estimated_annual_savings_usd: 30,  action_type: dbt_config,    deployed_relation_count: 1}
+        - {signal_id: expensive_query_monitor,   estimated_annual_savings_usd: 20,  action_type: investigation, deployed_relation_count: null}
+        - {signal_id: convert_to_incremental,    estimated_annual_savings_usd: 10,  action_type: snowflake_ddl, deployed_relation_count: 1}
+
+  - name: warehouse_optimizations_combines_config_and_model_signals
+    description: >
+      vw_snowflake__warehouse_optimizations passes warehouse config recommendations through
+      one row per signal, and groups model-level spillage and expensive-query signals into
+      one row per (warehouse, category) with an affected-model count, a sorted model list,
+      summed cost and savings, and the spillage_scale_up recommendation preferred over
+      other spillage recommendations. Each row is enriched with the warehouse's current
+      size from int_snowflake__warehouse_config.
+
+      Cases:
+        - WH_A oversized_scale_down: a config signal passes through with its own reason
+          and the warehouse's size (MEDIUM).
+        - WH_A spillage: two spillage signals on different models → one 'spillage' row,
+          2 models "m_one, m_two", savings 150; the scale-up recommendation (A_scale_up)
+          wins even though the other recommendation (Z_monitor) sorts higher.
+        - WH_B expensive_query: grouped as 'expensive_query'; no config row → null size.
+        - View chains: m1 ends a view chain (2 upstream views) → WH_A's spillage row lists
+          it in affected_models_in_view_chains with a note ("1 of 2"). m3 ends a chain too,
+          but its signal is an expensive query, so WH_B has no chain columns.
+        - Excluded: a stable config signal, a spillage signal with no warehouse, and a
+          non-warehouse-domain signal.
+      Mixed actionable/monitor and mixed-effort groups are covered by
+      warehouse_optimizations_mixed_groups_use_most_actionable_status_and_highest_effort.
+    model: vw_snowflake__warehouse_optimizations
+    given:
+      - input: ref('int_snowflake__all_recommendations')
+        rows:
+          - {domain: warehouse, warehouse_name: WH_A, signal_id: oversized_scale_down,       backlog_status: actionable, priority_tier: 4, hierarchy_rank: 2, recommendation: scale_down, recommendation_reason: oversized_reason, estimated_annual_savings_usd: 400, node_id: null, model_name: null}
+          - {domain: warehouse, warehouse_name: WH_A, signal_id: spillage_scale_up,          backlog_status: actionable, priority_tier: 4, hierarchy_rank: 3, recommendation: A_scale_up, recommendation_reason: r1, estimated_annual_cost_usd: 200, estimated_annual_savings_usd: 100, node_id: m1, model_name: m_one}
+          - {domain: warehouse, warehouse_name: WH_A, signal_id: spillage_moderate_stable,   backlog_status: actionable, priority_tier: 5, hierarchy_rank: 3, recommendation: Z_monitor,  recommendation_reason: r2, estimated_annual_cost_usd: 100, estimated_annual_savings_usd: 50,  node_id: m2, model_name: m_two}
+          - {domain: warehouse, warehouse_name: WH_B, signal_id: expensive_query_actionable, backlog_status: actionable, priority_tier: 5, hierarchy_rank: 3, recommendation: refactor,   recommendation_reason: r3, estimated_annual_cost_usd: 80,  estimated_annual_savings_usd: 40,  node_id: m3, model_name: m_three}
+          - {domain: warehouse, warehouse_name: WH_A, signal_id: oversized_disable_mcw,      backlog_status: stable,     priority_tier: 4, hierarchy_rank: 2, recommendation: ignored,    recommendation_reason: r4, estimated_annual_savings_usd: 999, node_id: null, model_name: null}
+          - {domain: warehouse, warehouse_name: null, signal_id: spillage_scale_up,          backlog_status: actionable, priority_tier: 4, hierarchy_rank: 3, recommendation: ignored,    recommendation_reason: r5, estimated_annual_savings_usd: 999, node_id: m9, model_name: m_nine}
+          - {domain: ai,        warehouse_name: WH_A, signal_id: ai_model_cost,              backlog_status: actionable, priority_tier: 6, hierarchy_rank: 9, recommendation: ignored,    recommendation_reason: r6, estimated_annual_savings_usd: 999, node_id: null, model_name: null}
+      - input: ref('int_snowflake__warehouse_config')
+        rows:
+          - {warehouse_name: WH_A, current_size: MEDIUM, warehouse_category: dbt}
+      - input: ref('int_snowflake__table_upstream_views')
+        rows:
+          - {table_dbt_model: m1, upstream_view_count: 2}
+          - {table_dbt_model: m3, upstream_view_count: 1}
+    expect:
+      rows:
+        - {warehouse_name: WH_A, signal_id: oversized_scale_down, warehouse_current_size: MEDIUM, affected_model_count: null, recommendation: scale_down, recommendation_reason: oversized_reason, estimated_annual_savings_usd: 400, affected_models_in_view_chains: null, view_chain_note: null}
+        - {warehouse_name: WH_A, signal_id: spillage,             warehouse_current_size: MEDIUM, affected_model_count: 2,    recommendation: A_scale_up, recommendation_reason: "2 model(s) affected: m_one, m_two. Resolve model-level optimizations (clustering/incremental) before applying warehouse config changes.", estimated_annual_savings_usd: 150, affected_models_in_view_chains: "m_one (2 upstream view(s))", view_chain_note: "1 of 2 spilling model(s) recompute upstream views on every build. Materializing the recommended view shrinks their working set. See vw_snowflake__dbt_model_optimizations."}
+        - {warehouse_name: WH_B, signal_id: expensive_query,      warehouse_current_size: null,   affected_model_count: 1,    recommendation: refactor,   recommendation_reason: "1 model(s) affected: m_three. Resolve model-level optimizations (clustering/incremental) before applying warehouse config changes.", estimated_annual_savings_usd: 40, affected_models_in_view_chains: null, view_chain_note: null}
+
+  - name: warehouse_optimizations_mixed_groups_use_most_actionable_status_and_highest_effort
+    description: >
+      When vw_snowflake__warehouse_optimizations groups several model-level signals into
+      one row, the row is actionable if ANY signal is actionable, and its effort_category
+      is the highest-effort one (architecture > sql_refactor > investigation >
+      actionable_review > config_change). This replaced an alphabetical max(), which
+      labeled mixed actionable/monitor groups as monitor and ranked efforts by spelling.
+
+      Cases (each one gave a wrong answer under the old alphabetical max()):
+        - WH_M spillage: actionable + monitor → actionable (old: monitor).
+        - WH_N expensive_query: both monitor; config_change + actionable_review →
+          actionable_review (old: config_change).
+        - WH_P spillage: architecture + sql_refactor → architecture (old: sql_refactor).
+    model: vw_snowflake__warehouse_optimizations
+    given:
+      - input: ref('int_snowflake__all_recommendations')
+        rows:
+          - {domain: warehouse, warehouse_name: WH_M, signal_id: spillage_scale_up,          backlog_status: actionable, effort_category: sql_refactor,      priority_tier: 4, hierarchy_rank: 3, recommendation: rec, node_id: m1, model_name: m_one}
+          - {domain: warehouse, warehouse_name: WH_M, signal_id: spillage_moderate_stable,   backlog_status: monitor,    effort_category: config_change,     priority_tier: 5, hierarchy_rank: 3, recommendation: rec, node_id: m2, model_name: m_two}
+          - {domain: warehouse, warehouse_name: WH_N, signal_id: expensive_query_monitor,    backlog_status: monitor,    effort_category: config_change,     priority_tier: 5, hierarchy_rank: 3, recommendation: rec, node_id: m3, model_name: m_three}
+          - {domain: warehouse, warehouse_name: WH_N, signal_id: expensive_query_actionable, backlog_status: monitor,    effort_category: actionable_review, priority_tier: 5, hierarchy_rank: 3, recommendation: rec, node_id: m4, model_name: m_four}
+          - {domain: warehouse, warehouse_name: WH_P, signal_id: spillage_scale_up,          backlog_status: actionable, effort_category: architecture,      priority_tier: 4, hierarchy_rank: 3, recommendation: rec, node_id: m5, model_name: m_five}
+          - {domain: warehouse, warehouse_name: WH_P, signal_id: spillage_moderate_worsening, backlog_status: actionable, effort_category: sql_refactor,     priority_tier: 5, hierarchy_rank: 3, recommendation: rec, node_id: m6, model_name: m_six}
+      - input: ref('int_snowflake__warehouse_config')
+        rows: []
+      - input: ref('int_snowflake__table_upstream_views')
+        rows: []
+    expect:
+      rows:
+        - {warehouse_name: WH_M, signal_id: spillage,        backlog_status: actionable, effort_category: sql_refactor}
+        - {warehouse_name: WH_N, signal_id: expensive_query, backlog_status: monitor,    effort_category: actionable_review}
+        - {warehouse_name: WH_P, signal_id: spillage,        backlog_status: actionable, effort_category: architecture}
+
+  - name: top_queried_models_aggregates_recent_selects_for_project_models
+    description: >
+      vw_snowflake__top_queried_models sums SELECT activity per table over the lookback
+      window (default 30 days), computes daily averages and durations, and keeps only
+      tables that are models of the monitored project(s). The test sets
+      dbt_monitored_projects explicitly, so it passes from any root project (the default,
+      [], means "the root project", which differs when the package is installed).
+
+      Cases:
+        - DB.S.T1: two recent days (10 + 20 selects, 3s each, 1 GB each) → 30 selects,
+          1.0/day, 6.0s total, 0.2s avg, 2.0 GB, 2 active days. A row dated 2000-01-01 is
+          outside the window and ignored.
+        - DB.S.T2: only zero-select activity → excluded.
+        - DB.S.T3: a model of another project → excluded.
+        - DB.S.T4: no matching dbt model → excluded.
+      Recent rows use 2099 dates so they always fall inside the window.
+      Not covered yet: dbt_monitored_projects = ['*'] (see open question).
+    model: vw_snowflake__top_queried_models
+    overrides:
+      vars:
+        dbt_monitored_projects: ['dbt_cost_optimization']
+    given:
+      - input: ref('int_snowflake__table_query_stats_daily')
+        rows:
+          - {table_database: DB, table_schema: S, table_name: T1, stats_date: 2099-01-01, select_count: 10,   select_execution_time_ms_sum: 3000,   bytes_scanned_sum: 1073741824}
+          - {table_database: DB, table_schema: S, table_name: T1, stats_date: 2099-01-02, select_count: 20,   select_execution_time_ms_sum: 3000,   bytes_scanned_sum: 1073741824}
+          - {table_database: DB, table_schema: S, table_name: T1, stats_date: 2000-01-01, select_count: 1000, select_execution_time_ms_sum: 999999, bytes_scanned_sum: 999999999999}
+          - {table_database: DB, table_schema: S, table_name: T2, stats_date: 2099-01-01, select_count: 0,    select_execution_time_ms_sum: 0,      bytes_scanned_sum: 0}
+          - {table_database: DB, table_schema: S, table_name: T3, stats_date: 2099-01-01, select_count: 5,    select_execution_time_ms_sum: 100,    bytes_scanned_sum: 100}
+          - {table_database: DB, table_schema: S, table_name: T4, stats_date: 2099-01-01, select_count: 5,    select_execution_time_ms_sum: 100,    bytes_scanned_sum: 100}
+      - input: ref('int_dbt__relations')
+        rows:
+          - {table_fqn: DB.S.T1, dbt_model: model.dbt_cost_optimization.t1, model_name: t1, package_name: dbt_cost_optimization}
+          - {table_fqn: DB.S.T2, dbt_model: model.dbt_cost_optimization.t2, model_name: t2, package_name: dbt_cost_optimization}
+          - {table_fqn: DB.S.T3, dbt_model: model.other_project.t3,                model_name: t3, package_name: other_project}
+    expect:
+      rows:
+        - {table_fqn: DB.S.T1, model_name: t1, total_selects_30d: 30, avg_daily_selects: 1.0, total_select_time_sec: 6.0, avg_query_duration_sec: 0.2, total_gb_scanned: 2.0, active_days: 2}
+
+  - name: top_spillage_models_attributes_source_and_latest_spilling_run
+    description: >
+      vw_snowflake__top_spillage_models lists spilling dbt models, labels each as this
+      project's or an installed package's (from the node id), totals local + remote
+      spillage, attaches the most recent spilling build in the last 30 days (run and job
+      ids parsed from the dbt query comment), and adds the spillage signal's priority.
+
+      Cases:
+        - m1 (this project): 2 + 1 GB → 3.0; of two recent spilling builds, the newer one
+          (run r_new) is attached; a build dated 2000-01-01 is ignored; priority 4.
+        - m2 (installed package): no spilling builds or priority → nulls.
+        - excluded: a 'Not available…' recommendation, and a row with no dbt model.
+      Recent builds use 2099 timestamps so they always fall inside the window.
+      Not covered yet: a table with more than one spillage signal (see open question).
+    model: vw_snowflake__top_spillage_models
+    given:
+      - input: ref('fct_snowflake__warehouse_performance_recommendations')
+        rows:
+          - {table_fqn: DB.S.M1, model_name: m1, dbt_model: model.dbt_cost_optimization.m1, warehouse_name: WH1, total_gb_spilled_local: 2, total_gb_spilled_remote: 1, recommendation: Scale up warehouse}
+          - {table_fqn: DB.S.M2, model_name: m2, dbt_model: model.other_pkg.m2,                     warehouse_name: WH1, total_gb_spilled_local: 1, total_gb_spilled_remote: 0, recommendation: Monitor}
+          - {table_fqn: DB.S.M3, model_name: m3, dbt_model: model.dbt_cost_optimization.m3, warehouse_name: WH1, total_gb_spilled_local: 9, total_gb_spilled_remote: 9, recommendation: Not available on Standard edition}
+          - {table_fqn: DB.S.M4, model_name: m4, dbt_model: null,                                   warehouse_name: WH1, total_gb_spilled_local: 9, total_gb_spilled_remote: 9, recommendation: Scale up warehouse}
+      - input: ref('int_snowflake__query_history')
+        rows:
+          - {query_text: '/* {"node_id": "model.dbt_cost_optimization.m1"} */ insert into t', dbt_cloud_run_id: r_new, dbt_cloud_job_id: j1, query_start_time: '2099-01-02 00:00:00', bytes_spilled_local: 1073741824}
+          - {query_text: '/* {"node_id": "model.dbt_cost_optimization.m1"} */ insert into t', dbt_cloud_run_id: r_old, dbt_cloud_job_id: j1, query_start_time: '2099-01-01 00:00:00', bytes_spilled_local: 1073741824}
+          - {query_text: '/* {"node_id": "model.dbt_cost_optimization.m1"} */ insert into t', dbt_cloud_run_id: r_ancient, dbt_cloud_job_id: j1, query_start_time: '2000-01-01 00:00:00', bytes_spilled_local: 1073741824}
+      - input: ref('int_snowflake__all_recommendations')
+        rows:
+          - {table_fqn: DB.S.M1, priority_tier: 4, signal_id: spillage_scale_up}
+    expect:
+      rows:
+        - {model_name: m1, model_source: project,           total_gb_spilled: 3, last_spilling_run_id: r_new, last_spilling_job_id: j1,   last_spill_gb: 1.0,  priority_tier: 4,    signal_id: spillage_scale_up}
+        - {model_name: m2, model_source: installed_package, total_gb_spilled: 1, last_spilling_run_id: null,  last_spilling_job_id: null, last_spill_gb: null, priority_tier: null, signal_id: null}
+
+  - name: dbt_model_optimizations_attaches_clustering_keys_and_incremental_context
+    description: >
+      vw_snowflake__dbt_model_optimizations lists actionable materialization and clustering
+      recommendations per model. Clustering rows get their suggested keys from
+      int_snowflake__clustering_key_summary, and clustering recommendations with no
+      suggested key are dropped. Incremental confidence is attached only to incremental
+      recommendations.
+
+      Cases:
+        - DB.S.T1 (clustering): keys 'col_a, col_b', additional candidate col_c.
+        - DB.S.T1 also has spillage_route_models (kept: a config change on the model). Its
+          row has no clustering keys: each row shows only its own fix's fields.
+        - DB.S.T2 (clustering): no candidate columns → dropped.
+        - DB.S.T3 (convert_to_incremental): seen in two environments → the higher-savings
+          row (300); incremental confidence 85 attached; deployed_relation_count 2.
+        - DB.S.T4 (materialize_as_table): incremental context stays null even though an
+          incremental config row exists for that table; its view-chain columns come from
+          the materialization fact. T3's fact row doesn't attach to its incremental signal.
+        - excluded: a 'monitor' clustering signal and a warehouse-domain signal.
+    model: vw_snowflake__dbt_model_optimizations
+    given:
+      - input: ref('int_snowflake__all_recommendations')
+        rows:
+          - {dedup_key: d1, domain: clustering,      signal_id: add_clustering_key_strong, table_fqn: DB.S.T1, node_id: n1, backlog_status: actionable, priority_tier: 3, estimated_annual_savings_usd: 50,  score: 1}
+          - {dedup_key: d2, domain: clustering,      signal_id: add_clustering_key_good,   table_fqn: DB.S.T2, node_id: n2, backlog_status: actionable, priority_tier: 3, estimated_annual_savings_usd: 40,  score: 1}
+          - {dedup_key: d3, domain: materialization, signal_id: convert_to_incremental,    table_fqn: DB.S.T3, node_id: n3, backlog_status: actionable, priority_tier: 2, estimated_annual_savings_usd: 100, score: 1}
+          - {dedup_key: d3, domain: materialization, signal_id: convert_to_incremental,    table_fqn: DB.S.T3, node_id: n3, backlog_status: actionable, priority_tier: 2, estimated_annual_savings_usd: 300, score: 1}
+          - {dedup_key: d4, domain: materialization, signal_id: materialize_as_table,      table_fqn: DB.S.T4, node_id: n4, backlog_status: actionable, priority_tier: 2, estimated_annual_savings_usd: 20,  score: 1}
+          - {dedup_key: d5, domain: clustering,      signal_id: add_clustering_key_good,   table_fqn: DB.S.T1, node_id: n5, backlog_status: monitor,    priority_tier: 3, estimated_annual_savings_usd: 999, score: 1}
+          - {dedup_key: d1, domain: warehouse,       signal_id: spillage_route_models,     table_fqn: DB.S.T1, node_id: n1, backlog_status: actionable, priority_tier: 2, estimated_annual_savings_usd: null, score: 1}
+          - {dedup_key: d6, domain: warehouse,       signal_id: oversized_scale_down,      table_fqn: null,    node_id: null, backlog_status: actionable, priority_tier: 4, estimated_annual_savings_usd: 999, score: 1}
+      - input: ref('int_snowflake__clustering_key_summary')
+        rows:
+          - {table_fqn: DB.S.T1, suggested_clustering_key: 'col_a, col_b', additional_clustering_candidates: col_c}
+      - input: ref('fct_snowflake__incremental_config_recommendations')
+        rows:
+          - {table_fqn: DB.S.T3, confidence_score: 85, recommendation_status: actionable_review}
+          - {table_fqn: DB.S.T4, confidence_score: 60, recommendation_status: investigate}
+      - input: ref('fct_snowflake__table_materialization_candidates')
+        rows:
+          - {table_fqn: DB.S.T4, chain_role: recommended, chosen_view_for_chain: DB.S.T4, recompute_cost_s: 12.5, recompute_cost_source: probe}
+          - {table_fqn: DB.S.T3, chain_role: alternative, chosen_view_for_chain: DB.S.T4, recompute_cost_s: 1, recompute_cost_source: reads}
+      - input: ref('int_snowflake__dbt_relation_history')
+        rows:
+          - {node_id: n3, table_fqn: DB.DEV.T3,  dbt_cloud_environment_id: env_dev}
+          - {node_id: n3, table_fqn: DB.PROD.T3, dbt_cloud_environment_id: env_prod}
+    expect:
+      rows:
+        - {table_fqn: DB.S.T1, signal_id: add_clustering_key_strong, suggested_clustering_key: 'col_a, col_b', additional_clustering_candidates: col_c, estimated_annual_savings_usd: 50,  incremental_confidence_score: null, deployed_relation_count: 1, chain_role: null,        recompute_cost_source: null}
+        - {table_fqn: DB.S.T1, signal_id: spillage_route_models,     suggested_clustering_key: null,           additional_clustering_candidates: null,  estimated_annual_savings_usd: null, incremental_confidence_score: null, deployed_relation_count: 1, chain_role: null,        recompute_cost_source: null}
+        - {table_fqn: DB.S.T3, signal_id: convert_to_incremental,    suggested_clustering_key: null,           additional_clustering_candidates: null,  estimated_annual_savings_usd: 300, incremental_confidence_score: 85,   deployed_relation_count: 2, chain_role: null,        recompute_cost_source: null}
+        - {table_fqn: DB.S.T4, signal_id: materialize_as_table,      suggested_clustering_key: null,           additional_clustering_candidates: null,  estimated_annual_savings_usd: 20,  incremental_confidence_score: null, deployed_relation_count: 1, chain_role: recommended, recompute_cost_source: probe}
+
+  - name: user_level_cost_attribution_splits_build_consumption_and_ai_spend
+    description: >
+      vw_snowflake__user_level_cost_attribution estimates each user's 30-day credits from
+      dbt builds (INSERT/MERGE/CTAS in dbt sessions for the monitored project),
+      consumption (SELECTs that read the project's models), and Cortex AI spend. Each
+      query uses its QUERY_ATTRIBUTION_HISTORY credits when there is a row, otherwise
+      elapsed time x its warehouse's list rate (credits per hour by size; 1 for an
+      unknown warehouse). Users are categorized and given a cost tier (> 10 high,
+      > 2 moderate), and credits_from_attribution is true when any credits came from QAH.
+
+      Cases:
+        - u_builder: 3,600 s of builds on WH1 (Medium, 4/hour) → 4.0 credits, builder,
+          moderate.
+        - u_consumer: 1,000 s of SELECTs on an unknown warehouse (1/hour) → 0.2778
+          credits, consumer, low.
+        - u_mixed: 36,000 s of builds on WH1 → 40 credits, plus one SELECT with a QAH row
+          of 0.5 credits (used instead of 1,000 s x 4/hour = 1.11) → mixed, high,
+          credits_from_attribution true.
+        - u_ai: 5 AI credits only → ai_user, moderate.
+        - Ignored: a build for another project, a build outside a dbt session, and a build
+          dated 2000-01-01.
+      Recent queries use 2099 timestamps so they always fall inside the window.
+    model: vw_snowflake__user_level_cost_attribution
+    given:
+      - input: ref('int_snowflake__warehouse_config')
+        rows:
+          - {warehouse_name: WH1, current_size: Medium}
+      - input: source('snowflake_usage', 'query_attribution_history')
+        rows:
+          - {query_id: q3, credits_attributed_compute: 0.5}
+      - input: ref('int_snowflake__dbt_sessions')
+        rows:
+          - {session_id: 1}
+      - input: ref('int_snowflake__query_history')
+        rows:
+          - {user_name: u_builder,  role_name: TRANSFORMER, query_id: q1, session_id: 1, warehouse_name: WH1,        query_type: INSERT, dbt_node_id: model.dbt_cost_optimization.a, total_elapsed_time_ms: 3600000,  query_start_time: '2099-01-01 00:00:00', query_text: insert}
+          - {user_name: u_mixed,    role_name: TRANSFORMER, query_id: q2, session_id: 1, warehouse_name: WH1,        query_type: MERGE,  dbt_node_id: model.dbt_cost_optimization.b, total_elapsed_time_ms: 36000000, query_start_time: '2099-01-01 00:00:00', query_text: merge}
+          - {user_name: u_mixed,    role_name: TRANSFORMER, query_id: q3, session_id: 9, warehouse_name: WH1,        query_type: SELECT, dbt_node_id: null,                                   total_elapsed_time_ms: 1000000,  query_start_time: '2099-01-01 00:00:00', query_text: select * from DB.S.T1}
+          - {user_name: u_consumer, role_name: ANALYST,     query_id: q4, session_id: 9, warehouse_name: WH_UNKNOWN, query_type: SELECT, dbt_node_id: null,                                   total_elapsed_time_ms: 1000000,  query_start_time: '2099-01-01 00:00:00', query_text: select * from DB.S.T1}
+          - {user_name: u_builder,  role_name: TRANSFORMER, query_id: q5, session_id: 1, warehouse_name: WH1,        query_type: INSERT, dbt_node_id: model.other_project.x,                 total_elapsed_time_ms: 99000000, query_start_time: '2099-01-01 00:00:00', query_text: insert}
+          - {user_name: u_builder,  role_name: TRANSFORMER, query_id: q6, session_id: 9, warehouse_name: WH1,        query_type: INSERT, dbt_node_id: model.dbt_cost_optimization.a, total_elapsed_time_ms: 99000000, query_start_time: '2099-01-01 00:00:00', query_text: insert}
+          - {user_name: u_builder,  role_name: TRANSFORMER, query_id: q7, session_id: 1, warehouse_name: WH1,        query_type: INSERT, dbt_node_id: model.dbt_cost_optimization.a, total_elapsed_time_ms: 99000000, query_start_time: '2000-01-01 00:00:00', query_text: insert}
+      - input: ref('int_dbt__relations')
+        rows:
+          - {database_name: DB, schema_name: S, table_name: T1, package_name: dbt_cost_optimization}
+      - input: ref('fct_snowflake__ai_user_spend_recommendations')
+        rows:
+          - {user_name: u_ai, default_role: DATA_SCIENTIST, total_credits_30d: 5, total_queries_30d: 50}
+    expect:
+      rows:
+        - {user_name: u_builder,  user_category: builder,  build_credits_30d: 4.0, consumption_credits_30d: 0,      ai_credits_30d: 0, combined_credits_30d: 4.0,    estimated_annual_cost_usd: 96,   credits_from_attribution: false, recommendation: "Moderate cost user — monitor trends"}
+        - {user_name: u_consumer, user_category: consumer, build_credits_30d: 0,   consumption_credits_30d: 0.2778, ai_credits_30d: 0, combined_credits_30d: 0.2778, estimated_annual_cost_usd: 6.67, credits_from_attribution: false, recommendation: "Low cost user"}
+        - {user_name: u_mixed,    user_category: mixed,    build_credits_30d: 40,  consumption_credits_30d: 0.5,    ai_credits_30d: 0, combined_credits_30d: 40.5,   estimated_annual_cost_usd: 972,  credits_from_attribution: true,  recommendation: "High cost user — review workload patterns"}
+        - {user_name: u_ai,       user_category: ai_user,  build_credits_30d: 0,   consumption_credits_30d: 0,      ai_credits_30d: 5, combined_credits_30d: 5,      estimated_annual_cost_usd: 120,  credits_from_attribution: false, recommendation: "Moderate cost user — monitor trends"}
+
+  - name: top_queried_models_monitor_all_projects
+    description: >
+      With dbt_monitored_projects set to ['*'], vw_snowflake__top_queried_models includes
+      tables from every dbt project instead of filtering to a list. Previously '*' was
+      treated as a literal project name and the view returned no rows.
+    model: vw_snowflake__top_queried_models
+    overrides:
+      vars:
+        dbt_monitored_projects: ['*']
+    given:
+      - input: ref('int_snowflake__table_query_stats_daily')
+        rows:
+          - {table_database: DB, table_schema: S, table_name: T1, stats_date: 2099-01-01, select_count: 10, select_execution_time_ms_sum: 1000, bytes_scanned_sum: 0}
+          - {table_database: DB, table_schema: S, table_name: T3, stats_date: 2099-01-01, select_count: 5,  select_execution_time_ms_sum: 1000, bytes_scanned_sum: 0}
+      - input: ref('int_dbt__relations')
+        rows:
+          - {table_fqn: DB.S.T1, dbt_model: model.dbt_cost_optimization.t1, model_name: t1, package_name: dbt_cost_optimization}
+          - {table_fqn: DB.S.T3, dbt_model: model.other_project.t3,                model_name: t3, package_name: other_project}
+    expect:
+      rows:
+        - {table_fqn: DB.S.T1, model_name: t1, total_selects_30d: 10}
+        - {table_fqn: DB.S.T3, model_name: t3, total_selects_30d: 5}
+
+  - name: top_spillage_models_one_row_per_model_with_multiple_signals
+    description: >
+      When a model has more than one spillage signal, vw_snowflake__top_spillage_models
+      still returns one row: priority_tier and signal_id come from the highest-priority
+      (lowest-tier) signal, and spillage_signal_count / all_spillage_signals list them
+      all. Previously the priority join fanned out to one row per signal.
+    model: vw_snowflake__top_spillage_models
+    given:
+      - input: ref('fct_snowflake__warehouse_performance_recommendations')
+        rows:
+          - {table_fqn: DB.S.M1, model_name: m1, dbt_model: model.dbt_cost_optimization.m1, warehouse_name: WH1, total_gb_spilled_local: 2, total_gb_spilled_remote: 1, recommendation: Scale up warehouse}
+      - input: ref('int_snowflake__query_history')
+        rows: []
+      - input: ref('int_snowflake__all_recommendations')
+        rows:
+          - {table_fqn: DB.S.M1, priority_tier: 4, signal_id: spillage_scale_up}
+          - {table_fqn: DB.S.M1, priority_tier: 5, signal_id: spillage_moderate_stable}
+    expect:
+      rows:
+        - {model_name: m1, priority_tier: 4, signal_id: spillage_scale_up, spillage_signal_count: 2, all_spillage_signals: 'spillage_moderate_stable, spillage_scale_up'}
+
+  - name: user_level_cost_attribution_counts_each_query_once_at_its_own_rate
+    description: >
+      vw_snowflake__user_level_cost_attribution computes credits per query, using that
+      query's own warehouse list rate, before summing per user. Previously a SELECT that
+      read several project models was counted once per model, and a single maximum rate
+      across a user's warehouses was applied to all of their time.
+
+      Cases:
+        - u_multi: one 1,000 s SELECT on WH1 (Medium, 4/hour) that reads two project
+          models → 1.1111 consumption credits (not 2.2222).
+        - u_two_wh: 1,000 s of builds on WH1 (4/hour) and 1,000 s on WH2 (Large, 8/hour)
+          → 1.1111 + 2.2222 = 3.3333 build credits (not 8/hour x 2,000 s = 4.4444).
+    model: vw_snowflake__user_level_cost_attribution
+    given:
+      - input: ref('int_snowflake__warehouse_config')
+        rows:
+          - {warehouse_name: WH1, current_size: Medium}
+          - {warehouse_name: WH2, current_size: Large}
+      - input: source('snowflake_usage', 'query_attribution_history')
+        rows: []
+      - input: ref('int_snowflake__dbt_sessions')
+        rows:
+          - {session_id: 1}
+      - input: ref('int_snowflake__query_history')
+        rows:
+          - {user_name: u_multi,  role_name: ANALYST,     query_id: q1, session_id: 9, warehouse_name: WH1, query_type: SELECT, dbt_node_id: null, total_elapsed_time_ms: 1000000, query_start_time: '2099-01-01 00:00:00', query_text: select * from DB.S.T1 join DB.S.T2 using (id)}
+          - {user_name: u_two_wh, role_name: TRANSFORMER, query_id: q2, session_id: 1, warehouse_name: WH1, query_type: INSERT, dbt_node_id: model.dbt_cost_optimization.a, total_elapsed_time_ms: 1000000, query_start_time: '2099-01-01 00:00:00', query_text: insert}
+          - {user_name: u_two_wh, role_name: TRANSFORMER, query_id: q3, session_id: 1, warehouse_name: WH2, query_type: INSERT, dbt_node_id: model.dbt_cost_optimization.a, total_elapsed_time_ms: 1000000, query_start_time: '2099-01-01 00:00:00', query_text: insert}
+      - input: ref('int_dbt__relations')
+        rows:
+          - {database_name: DB, schema_name: S, table_name: T1, package_name: dbt_cost_optimization}
+          - {database_name: DB, schema_name: S, table_name: T2, package_name: dbt_cost_optimization}
+      - input: ref('fct_snowflake__ai_user_spend_recommendations')
+        rows: []
+    expect:
+      rows:
+        - {user_name: u_multi,  user_category: consumer, build_credits_30d: 0,      consumption_credits_30d: 1.1111, combined_credits_30d: 1.1111}
+        - {user_name: u_two_wh, user_category: builder,  build_credits_30d: 3.3333, consumption_credits_30d: 0,      combined_credits_30d: 3.3333}

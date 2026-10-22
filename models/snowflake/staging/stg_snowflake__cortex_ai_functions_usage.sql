@@ -1,0 +1,25 @@
+{{ config(
+    materialized='incremental',
+    unique_key=['query_id', 'function_name', 'model_name'],
+    on_schema_change='append_new_columns',
+) }}
+
+select
+    start_time,
+    end_time,
+    function_name,
+    model_name,
+    query_id,
+    warehouse_id,
+    role_names,
+    query_tag,
+    user_id,
+    metrics,
+    credits,
+    is_completed
+from {{ source('snowflake_usage', 'cortex_ai_functions_usage_history') }}
+{% if is_incremental() %}
+  where start_time >= (select dateadd(day, -{{ var('incremental_overlap_days', 31) }}, max(start_time)) from {{ this }})
+{% else %}
+  where start_time >= dateadd(day, -{{ var('incremental_overlap_days', 31) }}, current_timestamp())
+{% endif %}

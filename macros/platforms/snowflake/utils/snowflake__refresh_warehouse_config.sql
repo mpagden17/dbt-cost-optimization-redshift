@@ -1,0 +1,89 @@
+{% macro snowflake__refresh_warehouse_config() %}
+
+  {#--
+    Captures current warehouse configuration from SHOW WAREHOUSES and merges
+    into int_snowflake__warehouse_config. Provides settings not available in
+    any ACCOUNT_USAGE view: auto_suspend, auto_resume, scaling_policy,
+    min_cluster_count, max_cluster_count.
+
+    Runs as a post-hook on int_snowflake__warehouse_config so the base model
+    builds from WAREHOUSE_EVENTS_HISTORY first, then this macro enriches with
+    live config from SHOW WAREHOUSES.
+
+    SHOW WAREHOUSES returns one row per warehouse — no looping needed. A max cluster
+    count above 1 also marks the warehouse multi-cluster: the events model only sees
+    multi-cluster warehouses that spun up a second cluster in its window.
+  --#}
+
+  {% if execute and target.type == 'snowflake' %}
+
+    {% set is_enterprise = var('snowflake_enterprise_edition', true) %}
+    {% set config_table = ref('int_snowflake__warehouse_config') %}
+
+    {{ log("refresh_warehouse_config: running SHOW WAREHOUSES...", info=true) }}
+
+    {# Step 1: Run SHOW WAREHOUSES and capture results into a temp table #}
+    {% set show_sql %}
+      create or replace temporary table {{ config_table.database }}.{{ config_table.schema }}.tmp_show_warehouses as
+      select * from table(result_scan(last_query_id()))
+    {% endset %}
+
+    {% do run_query("SHOW WAREHOUSES") %}
+    {% do run_query(show_sql) %}
+
+    {# Step 2: Merge SHOW data into the warehouse config table #}
+    {% set merge_sql %}
+      merge into {{ config_table }} as target
+      using (
+          select
+              "name" as warehouse_name,
+              "size" as current_size,
+              lower("size") in ('x-small', 'xsmall') as is_smallest_size,
+              lower("size") in ('6x-large', 'x6large') as is_largest_size,
+              "auto_suspend"::int as auto_suspend_seconds,
+              "auto_resume"::boolean as auto_resume,
+              {% if is_enterprise %}
+              coalesce("scaling_policy", 'STANDARD') as scaling_policy,
+              coalesce("min_cluster_count", 1)::int as min_cluster_count,
+              coalesce("max_cluster_count", 1)::int as max_cluster_count
+              {% else %}
+              'STANDARD' as scaling_policy,
+              1 as min_cluster_count,
+              1 as max_cluster_count
+              {% endif %}
+          from {{ config_table.database }}.{{ config_table.schema }}.tmp_show_warehouses
+      ) as source
+      on target.warehouse_name = source.warehouse_name
+      when matched then update set
+          current_size         = source.current_size,
+          is_smallest_size     = source.is_smallest_size,
+          is_largest_size      = source.is_largest_size,
+          auto_suspend_seconds = source.auto_suspend_seconds,
+          auto_resume          = source.auto_resume,
+          scaling_policy       = source.scaling_policy,
+          min_cluster_count    = source.min_cluster_count,
+          max_cluster_count    = source.max_cluster_count,
+          -- A warehouse configured for more than one cluster is multi-cluster even if it
+          -- hasn't spun up a second cluster in the events window
+          is_multicluster      = target.is_multicluster or source.max_cluster_count > 1,
+          warehouse_category   = case
+                                     when target.warehouse_category = 'adaptive' then 'adaptive'
+                                     when target.is_multicluster or source.max_cluster_count > 1 then 'multi_cluster'
+                                     else target.warehouse_category
+                                 end
+      when not matched then insert
+          (warehouse_name, current_size, is_smallest_size, is_largest_size, auto_suspend_seconds, auto_resume, scaling_policy, min_cluster_count, max_cluster_count, is_multicluster)
+      values
+          (source.warehouse_name, source.current_size, source.is_smallest_size, source.is_largest_size, source.auto_suspend_seconds, source.auto_resume, source.scaling_policy, source.min_cluster_count, source.max_cluster_count, source.max_cluster_count > 1)
+    {% endset %}
+
+    {% do run_query(merge_sql) %}
+
+    {# Step 3: Clean up temp table #}
+    {% do run_query("DROP TABLE IF EXISTS " ~ config_table.database ~ "." ~ config_table.schema ~ ".tmp_show_warehouses") %}
+
+    {{ log("refresh_warehouse_config: merged config for all warehouses.", info=true) }}
+
+  {% endif %}
+
+{% endmacro %}

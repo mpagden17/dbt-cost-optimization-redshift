@@ -1,0 +1,443 @@
+version: 2
+
+models:
+
+  # ===========================================================================
+  # int_snowflake__table_inventory
+  # ===========================================================================
+  - name: int_snowflake__table_inventory
+    description: >
+      Snowflake table inventory combining table metadata and storage metrics.
+      Contains active table-level size, row count, and clustering metadata used
+      by multiple optimization marts.
+    columns:
+      - name: database_name
+        description: Snowflake database name
+      - name: schema_name
+        description: Snowflake schema name
+      - name: table_name
+        description: Snowflake table name
+      - name: table_fqn
+        description: Fully-qualified table name (database.schema.table)
+      - name: table_type
+        description: Snowflake native table type
+      - name: normalized_table_type
+        description: Human-readable table classification
+      - name: row_count
+        description: Approximate row count
+      - name: clustering_key
+        description: Clustering key definition, if configured
+      - name: is_already_clustered
+        description: Whether clustering key is configured
+      - name: is_transient
+        description: Whether table is transient
+      - name: active_bytes
+        description: Active storage bytes
+      - name: size_gb
+        description: Active storage converted to GB
+      - name: approx_micropartitions
+        description: Approximate micropartition count derived from active bytes
+
+  # ===========================================================================
+  # int_snowflake__query_table_access
+  # ===========================================================================
+  - name: int_snowflake__query_table_access
+    description: >
+      One row per (query_id, table) from Snowflake access_history. Flattens
+      base_objects_accessed and objects_modified for exact object-level attribution
+      without query_text scan. Used by table_query_stats_daily and recommendation marts.
+    columns:
+      - name: query_id
+        description: Snowflake query identifier (joins to query_history)
+      - name: query_start_time
+        description: Query start time from access_history
+      - name: table_database
+        description: Database from parsed objectName
+      - name: table_schema
+        description: Schema from parsed objectName
+      - name: table_name
+        description: Table from parsed objectName
+
+  # ===========================================================================
+  # int_snowflake__table_query_stats_daily
+  # ===========================================================================
+  - name: int_snowflake__table_query_stats_daily
+    description: >
+      Incremental daily query statistics by Snowflake table. Uses access_history
+      (query_table_access) for attribution instead of query_text. Shared intermediate
+      for clustering, spillage, compute efficiency, and join-pattern marts.
+    columns:
+      - name: table_query_stats_daily_key
+        description: Surrogate key for stats_date + table relation
+      - name: stats_date
+        description: Date grain of aggregated query statistics
+      - name: table_database
+        description: Snowflake database name
+      - name: table_schema
+        description: Snowflake schema name
+      - name: table_name
+        description: Snowflake table name
+      - name: total_query_count
+        description: Total count of successful queries matched to the table
+      - name: select_count
+        description: Count of SELECT queries
+      - name: dml_count
+        description: Count of INSERT/UPDATE/DELETE/MERGE queries
+      - name: select_execution_time_ms_sum
+        description: Sum of execution_time_ms for matched SELECT queries
+      - name: select_partitions_scanned_sum
+        description: Sum of partitions_scanned for matched SELECT queries
+      - name: select_partitions_total_sum
+        description: Sum of partitions_total for matched SELECT queries
+      - name: bytes_scanned_sum
+        description: Sum of bytes scanned across matched queries
+      - name: bytes_spilled_local_sum
+        description: Sum of local spill bytes across matched queries
+      - name: bytes_spilled_remote_sum
+        description: Sum of remote spill bytes across matched queries
+
+  # ===========================================================================
+  # int_snowflake__table_columns
+  # ===========================================================================
+  - name: int_snowflake__table_columns
+    description: >
+      Column metadata for all active Snowflake tables, scoped to tables present in
+      int_snowflake__table_inventory. Excludes unsupported data types (VARIANT, ARRAY,
+      OBJECT, GEOGRAPHY, GEOMETRY) and deleted columns. Real cardinality for these columns
+      is populated separately by the refresh_column_cardinality macro into
+      int_snowflake__column_cardinality.
+    columns:
+      - name: database_name
+        description: Snowflake database name (uppercased)
+      - name: schema_name
+        description: Snowflake schema name (uppercased)
+      - name: table_name
+        description: Table name (uppercased)
+      - name: table_fqn
+        description: Fully-qualified table name in DATABASE.SCHEMA.TABLE format (uppercased)
+      - name: column_name
+        description: Column name
+      - name: ordinal_position
+        description: Column position in the table definition (1-based)
+      - name: data_type
+        description: Snowflake data type of the column
+      - name: is_nullable
+        description: Whether the column allows null values
+
+  # ===========================================================================
+  # int_snowflake__column_query_access
+  # ===========================================================================
+  - name: int_snowflake__column_query_access
+    description: >
+      One row per (query_id, table_fqn, column_name) from Snowflake ACCESS_HISTORY.
+      Extends int_snowflake__query_table_access by flattening the columns[] array within
+      each accessed object, providing exact engine-reported column-level read attribution.
+      Enterprise+ only — disabled when snowflake_enterprise_edition = false.
+    columns:
+      - name: query_id
+        description: Snowflake query identifier
+      - name: query_start_time
+        description: Query start timestamp from ACCESS_HISTORY
+      - name: table_fqn
+        description: Fully-qualified table name parsed from objectName (uppercased)
+      - name: table_database
+        description: Database component of the table FQN
+      - name: table_schema
+        description: Schema component of the table FQN
+      - name: table_name
+        description: Table component of the table FQN
+      - name: column_name
+        description: Column name from ACCESS_HISTORY columns[] (uppercased)
+
+  # ===========================================================================
+  # int_snowflake__column_query_stats
+  # ===========================================================================
+  - name: int_snowflake__column_query_stats
+    description: >
+      Daily column-level query access counts per table, aggregated from
+      int_snowflake__column_query_access joined with int_snowflake__query_history
+      for query_text classification. One row per (access_date, table_fqn, column_name).
+      Incremental merge on column_query_stats_daily_key — processes new access_history
+      data only, with a 1-day lookback buffer to handle ACCESS_HISTORY latency.
+      Used by fct_snowflake__clustering_key_candidates for WHERE/JOIN usage scoring.
+      query_count (any access) is also used by refresh_column_cardinality to pre-filter
+      which columns are worth running APPROX_COUNT_DISTINCT against.
+      Enterprise+ only — disabled when snowflake_enterprise_edition = false.
+    config:
+      materialized: incremental
+    columns:
+      - name: column_query_stats_daily_key
+        description: Surrogate key derived from md5(access_date || table_fqn || column_name)
+      - name: table_fqn
+        description: Fully-qualified table name
+      - name: table_database
+        description: Database component of the table FQN
+      - name: table_schema
+        description: Schema component of the table FQN
+      - name: table_name
+        description: Table component of the table FQN
+      - name: column_name
+        description: Column name
+      - name: access_date
+        description: Calendar date of the query access
+      - name: query_count
+        description: Count of distinct query_ids that accessed this column on this date (any access type)
+
+
+  # ===========================================================================
+  # int_snowflake__query_operator_evidence
+  # ===========================================================================
+  - name: int_snowflake__query_operator_evidence
+    description: >
+      Unified operator evidence accumulator from GET_QUERY_OPERATOR_STATS.
+      Captures TableScan (partition pruning), Filter (WHERE columns), and Join
+      (equality columns) evidence. Populated by the extract_operator_evidence
+      macro; the dbt model defines schema only.
+    columns:
+      - name: operator_evidence_key
+        description: MD5 surrogate key (query_id | operator_type | table_fqn [| column_name])
+      - name: query_id
+        description: Snowflake query identifier
+      - name: table_fqn
+        description: Fully-qualified table name referenced in the operator
+      - name: operator_type
+        description: "Type of operator: 'TableScan', 'Filter', or 'Join'"
+      - name: column_name
+        description: Column name parsed from the operator condition (NULL for TableScan)
+      - name: partitions_scanned
+        description: Number of micro-partitions scanned (TableScan only)
+      - name: partitions_total
+        description: Total micro-partitions in the table (TableScan only)
+      - name: bytes_scanned
+        description: Bytes scanned during table access (TableScan only)
+      - name: condition_text
+        description: Raw filter/join condition from operator attributes (Filter/Join only)
+      - name: query_parameterized_hash
+        description: Parameterized query hash for deduplication
+      - name: query_start_time
+        description: Query start timestamp (from QUERY_HISTORY)
+      - name: access_date
+        description: Calendar date of the query (cast from query_start_time)
+
+  # ===========================================================================
+  # int_snowflake__query_workload_class
+  # ===========================================================================
+  - name: int_snowflake__query_workload_class
+    description: >
+      Classifies queries by workload type using dbt query comment metadata
+      and query_type. Used by clustering pipeline to separate consumption
+      scans from build/test scans.
+    columns:
+      - name: query_id
+        description: Snowflake query identifier
+      - name: workload_class
+        description: "Classification: 'consumption', 'dbt_model_build', 'dbt_test', 'package_internal', 'unknown'"
+      - name: classification_confidence
+        description: "Confidence level: 'high' (dbt metadata), 'medium' (query_type heuristic), 'low' (unknown)"
+
+  # ===========================================================================
+  # int_snowflake__column_cardinality
+  # ===========================================================================
+  - name: int_snowflake__column_cardinality
+    description: >
+      Persistent store for column-level APPROX_COUNT_DISTINCT values produced by
+      the refresh_column_cardinality macro. dbt creates the empty table schema on
+      first run; all data is written and maintained exclusively by the macro, which
+      runs as a post-hook on fct_snowflake__table_clustering_candidates. dbt never
+      inserts rows directly — the incremental model always returns 0 rows, preserving
+      macro-written data across runs.
+    columns:
+      - name: table_fqn
+        description: Fully-qualified table name
+      - name: column_name
+        description: Column name
+      - name: distinct_values
+        description: Approximate distinct value count from APPROX_COUNT_DISTINCT
+      - name: total_rows
+        description: Total row count of the table at time of scan
+      - name: calculated_at
+        description: Timestamp when the macro last populated or updated this record
+
+  # ===========================================================================
+  # int_snowflake__query_history
+  # ===========================================================================
+  - name: int_snowflake__query_history
+    description: >
+      Thin incremental pass-through of stg_snowflake__query_history with column renames
+      (e.g., start_time → query_start_time, total_elapsed_time → total_elapsed_time_ms).
+      Provides a stable interface for downstream models and filters to successful queries only.
+      Clustered by to_date(query_start_time).
+
+  # ===========================================================================
+  # int_snowflake__warehouse_query_stats_daily
+  # ===========================================================================
+  - name: int_snowflake__warehouse_query_stats_daily
+    description: >
+      Daily per-warehouse aggregate stats for dbt-authored queries. Grain: (warehouse_name, stats_date).
+      Provides medians for overload, provisioning, and execution time; DML ratio; query load percent.
+      Used by fct_snowflake__warehouse_config_recommendations.
+
+  # ===========================================================================
+  # int_snowflake__warehouse_expensive_queries_daily
+  # ===========================================================================
+  - name: int_snowflake__warehouse_expensive_queries_daily
+    description: >
+      Daily per-query-hash credit consumption for dbt-authored queries. Grain: (query_hash, stats_date).
+      Uses QUERY_ATTRIBUTION_HISTORY for exact credits where available, falling back to
+      elapsed-time proration from WAREHOUSE_METERING_HISTORY. Surfaces top_user_name and
+      top_role_name per query pattern.
+
+  # ===========================================================================
+  # int_snowflake__warehouse_suspend_cycles
+  # ===========================================================================
+  - name: int_snowflake__warehouse_suspend_cycles
+    description: >
+      Suspend and MCW spindown cycle counts per warehouse over the last 30 days.
+      Used by int_snowflake__all_recommendations to compute data-driven idle credit
+      savings. Grain: one row per warehouse_name.
+
+  # ===========================================================================
+  # int_snowflake__view_chains
+  # ===========================================================================
+  - name: int_snowflake__view_chains
+    description: >
+      One row per view or ephemeral that feeds at least one table through views and
+      ephemerals only, aggregated from int_snowflake__view_chain_pairs:
+      downstream_table_count, downstream_table_fqns, and min_hops_to_table, for view
+      chain impact scoring.
+
+  # ===========================================================================
+  # int_snowflake__view_chain_pairs
+  # ===========================================================================
+  - name: int_snowflake__view_chain_pairs
+    description: >
+      Recursive walk of the dbt DAG from each view or ephemeral through its view and
+      ephemeral children until reaching a table. Grain: one row per (upstream view or
+      ephemeral, downstream table) with no table in between. Every build of the table
+      recomputes the upstream model's SQL inline. path_length is the fewest hops
+      (1 = feeds the table directly). Credits downstream builds to every view in a
+      chain, and drives the view probe and the one-view-per-chain choice.
+
+  # ===========================================================================
+  # int_snowflake__dbt_job_spillage
+  # ===========================================================================
+  - name: int_snowflake__clustering_key_summary
+    description: >
+      Suggested clustering keys per table from the latest fct_snowflake__clustering_key_candidates
+      snapshot: columns whose filter evidence is at least 70% of the top column's, in key order,
+      plus the remaining candidates and a ready-to-paste cluster_by config. The one source for
+      clustering keys and configs in int_snowflake__all_recommendations and the gold views.
+    columns:
+      - name: table_fqn
+        data_tests:
+          - unique
+          - not_null
+      - name: suggested_clustering_key
+        description: Recommended clustering columns, e.g. 'ORDERED_DATE, SHOP_ID'. Null when none pass.
+      - name: additional_clustering_candidates
+        description: Columns that passed the candidate gates but are below 70% of the top column's filter evidence.
+      - name: cluster_by_config
+        description: A dbt config block setting cluster_by to the suggested key; null when there's none.
+
+  - name: int_snowflake__dbt_job_spillage
+    description: >
+      Job-level spillage, one row per dbt job over spillage_lookback_days. Jobs come
+      from dbt_cloud_job_id in dbt's query comment; a run outside the dbt platform with
+      invocation_id in its query comment is its own job ('invocation:<id>'). Per job:
+      models built and spilling (spilling_model_share_pct), build time and the spilling
+      models' share of it (spilling_time_share_pct), spill GB, the warehouse (and
+      whether other jobs share it), the spilling models with their build seconds, and
+      the next warehouse size up. The rule
+      (spillage_job_* vars): spilling_time_share_pct below the minimum → no signal;
+      model share at or below the routing maximum → spillage_route_models, above →
+      spillage_job_scale_up; time share at or above the actionable threshold →
+      actionable, else monitor. evidence states both shares, e.g. "3 of 16 models (19%)
+      took 92% of this job's build time".
+
+  # ===========================================================================
+  # int_snowflake__query_spill_evidence
+  # ===========================================================================
+  - name: int_snowflake__query_spill_evidence
+    description: >
+      Where sampled spilling queries' time goes, from GET_QUERY_OPERATOR_STATS. One row
+      per (query, table it's attributed to). Written by the extract_spill_evidence
+      post-hook on fct_snowflake__warehouse_performance_recommendations: for each
+      spilling table, the most recent completed spilling query of each query shape in
+      the last 14 days (up to 5). spill_blocked_s = execution time x the disk I/O share
+      of operators with spilling statistics only (other disk I/O, like scans and cache
+      reads, isn't spill); it's a lower bound on what removing the spill saves.
+      evidence_status 'skipped' (with skip_reason) when the stats couldn't be read: the
+      role must own the query or hold MONITOR on its warehouse. Enterprise edition.
+
+  # ===========================================================================
+  # int_snowflake__table_upstream_views
+  # ===========================================================================
+  - name: int_snowflake__table_upstream_views
+    description: >
+      One row per table at the end of a view chain: upstream_view_chain (the views and
+      ephemerals its builds recompute inline, nearest first, each with its
+      materialization), upstream_view_count, and chain_recommended_view (the view the
+      materialization fact recommends for this table; null when none is a candidate).
+      Feeds the view_chain signal in vw_snowflake__cross_domain_insights and the chain
+      columns in the spillage views.
+
+  # ===========================================================================
+  # int_snowflake__view_probe
+  # ===========================================================================
+  - name: int_snowflake__view_probe
+    description: >
+      Measured recompute cost of views in view chains, one row per view (the latest
+      probe). Written by the probe_view_recompute post-hook on this model, which runs
+      select hash_agg(*) from the view with the result cache off: hash_agg(*) forces
+      every column to be computed. Up to table_materialization_view_probe_limit views
+      per run (default 10; 0 turns it off), deepest chains first, re-probed after
+      table_materialization_view_probe_refresh_days (default 7). Skips this package's
+      views, views outside dbt_monitored_projects, and schemas in
+      dbt_excluded_schemas. A probe that fails (dropped view, no SELECT privilege) is
+      recorded with probe_status 'failed' instead of failing the build. The time is
+      measured on the warehouse running the package (warehouse_name, warehouse_size).
+
+  # ===========================================================================
+  # int_snowflake__direct_object_access
+  # ===========================================================================
+  - name: int_snowflake__direct_object_access
+    description: >
+      Flattens ACCESS_HISTORY.direct_objects_accessed to provide exact engine-reported
+      query-to-object attribution at the view/table level. Unlike base_objects_accessed
+      (which resolves through views), this preserves the actual objects referenced.
+      Enterprise+ only (requires ACCESS_HISTORY).
+
+  # ===========================================================================
+  # int_snowflake__dbt_relation_history
+  # ===========================================================================
+  - name: int_snowflake__dbt_relation_history
+    description: >
+      Cross-environment dbt model discovery. Parses the dbt query comment JSON from
+      QUERY_HISTORY to map each logical dbt model (node_id) to every physical FQN
+      where it has been materialized across environments (dev, staging, prod).
+      Grain: one row per physical table (table_fqn). A table built under several
+      target names is one row: target_name is the latest build's, and target_names /
+      dbt_cloud_environment_ids list all of them. is_excluded applies the
+      dbt_excluded_schemas / dbt_excluded_targets vars. Rebuilt as a table each run
+      over dbt_relation_history_lookback_days.
+
+  # ===========================================================================
+  # int_snowflake__all_recommendations
+  # ===========================================================================
+  - name: int_snowflake__all_recommendations
+    description: >
+      Unified recommendation surface that normalizes recommendations from all
+      domain-specific fact models into a single interface with cost estimation and
+      effort classification. Shared foundation for all gold-layer views.
+      Grain: one row per (entity_name, domain, recommendation, table_fqn).
+    columns:
+      - name: estimated_annual_hours_saved
+        description: >
+          Spillage only. Scale-ups: hours of runtime saved a year, from the measured
+          spilling runtime and the benchmark efficiency of the step up. SQL refactors:
+          the time spilling operators were blocked on disk, from operator stats (null
+          without them).
+      - name: estimated_annual_cost_change_usd
+        description: >
+          Spillage scale-ups only: the change in annual cost from scaling up (positive =
+          costs more). Scale-ups trade credits for time, so their savings are null.
