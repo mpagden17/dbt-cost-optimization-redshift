@@ -76,7 +76,7 @@ Add to your `packages.yml`:
 
 ```yaml
 packages:
-  - git: "https://github.com/dbt-labs/dbt-cost-optimization.git"
+  - git: "https://github.com/dbt-labs/dbt-cost-optimization-redshift.git"
     revision: main
 ```
 
